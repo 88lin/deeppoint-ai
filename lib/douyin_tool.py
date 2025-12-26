@@ -50,11 +50,134 @@ except ImportError:
 
 class DouyinApi:
     """抖音API封装类"""
-    
+
     def __init__(self):
         self.page = None
         self.is_browser_open = False
-    
+
+    def _parse_video_title(self, raw_text: str) -> Dict:
+        """
+        解析视频标题混合文本，提取各个字段
+        格式: "时长\n播放量\n标题内容\n@作者+时间"
+        例如: "01:32\n5655\n跟着大师学睡觉！...\n@仙仙不闲6月前"
+        """
+        if not raw_text:
+            return {'title': '', 'author': 'unknown', 'likes': '0', 'publish_time': ''}
+
+        lines = raw_text.strip().split('\n')
+        result = {'title': '', 'author': 'unknown', 'likes': '0', 'publish_time': ''}
+
+        if len(lines) < 2:
+            # 如果格式不对，整个作为标题
+            result['title'] = raw_text.strip()
+            return result
+
+        # 第一行：时长（跳过）
+        # 第二行：播放量
+        if len(lines) >= 2:
+            result['likes'] = lines[1].strip()
+
+        # 第三行开始到倒数第二行：标题内容
+        if len(lines) >= 3:
+            # 找到最后一个以@开头的行
+            title_lines = []
+            author_line_idx = -1
+
+            for i in range(2, len(lines)):
+                if lines[i].startswith('@'):
+                    author_line_idx = i
+                    break
+                title_lines.append(lines[i])
+
+            # 如果没找到@，倒数第一行可能是作者
+            if author_line_idx == -1 and len(lines) > 3:
+                author_line_idx = len(lines) - 1
+                title_lines = lines[2:author_line_idx]
+
+            result['title'] = ' '.join(title_lines).strip()
+
+            # 解析作者和时间
+            if author_line_idx != -1 and author_line_idx < len(lines):
+                author_text = lines[author_line_idx]
+                # 格式: "@作者名7月前" 或 "@作者名 7月前"
+                author_text = author_text.lstrip('@')
+                # 用正则提取作者和时间
+                import re
+                match = re.match(r'^(.+?)(\d+[年月周天小时分钟]+前)$', author_text)
+                if match:
+                    result['author'] = match.group(1).strip()
+                    result['publish_time'] = match.group(2).strip()
+                else:
+                    result['author'] = author_text.strip()
+
+        return result
+
+    def _parse_comment_text(self, full_text: str, spans: List) -> Dict:
+        """
+        从评论的完整文本和span列表中提取结构化数据
+
+        full_text 格式: "用户名\n...\n评论内容\n6月前·地区\n点赞数\n分享\n回复"
+        spans: 包含多个重复用户名的span，class="WFJiGxr7"的span是评论内容
+        """
+        result = {'username': 'unknown', 'text': '', 'likes': '0'}
+
+        if not full_text:
+            return result
+
+        # 从spans中提取用户名和评论内容
+        username_found = False
+        text_found = False
+
+        if spans:
+            for span_data in spans:
+                span_text = span_data.get('text', '').strip()
+                span_class = span_data.get('class', '')
+
+                # 用户名：前几个span，非空且不太长
+                if not username_found and span_text and len(span_text) < 50 and '分享' not in span_text and '回复' not in span_text:
+                    result['username'] = span_text
+                    username_found = True
+
+                # 评论内容：class包含"WFJiGxr7"
+                if 'WFJiGxr7' in span_class and span_text:
+                    result['text'] = span_text
+                    text_found = True
+                    break
+
+        # 如果spans没找到评论内容，从full_text解析
+        if not text_found:
+            lines = full_text.split('\n')
+            # 过滤掉无用行
+            content_lines = []
+            for line in lines:
+                line = line.strip()
+                # 跳过这些关键词
+                if line and line != '...' and '分享' not in line and '回复' not in line and '展开' not in line and '作者' not in line:
+                    # 检查是否是时间地区格式 (如 "6月前·山东")
+                    if re.search(r'\d+[年月周天小时分钟]+前', line):
+                        continue
+                    # 检查是否纯数字（点赞数）
+                    if re.match(r'^\d+$', line):
+                        result['likes'] = line
+                        continue
+                    content_lines.append(line)
+
+            # 第一行是用户名，其余是评论内容
+            if content_lines:
+                if not username_found:
+                    result['username'] = content_lines[0]
+                if len(content_lines) > 1:
+                    result['text'] = ' '.join(content_lines[1:])
+
+        # 从full_text中提取点赞数（正则匹配独立的数字）
+        if result['likes'] == '0':
+            # 查找格式: "时间·地区\n数字\n分享"
+            match = re.search(r'[·]\s*[\u4e00-\u9fa5]+\s*\n\s*(\d+)\s*\n\s*分享', full_text)
+            if match:
+                result['likes'] = match.group(1)
+
+        return result
+
     def init_browser(self):
         """初始化浏览器（增强反检测能力）"""
         if not DRISSION_AVAILABLE:
@@ -475,7 +598,7 @@ class DouyinApi:
         return text
 
     async def _extract_comments(self, page, max_comments: int = 50) -> List[Dict]:
-        """提取评论数据"""
+        """提取评论数据（改进版本 - 使用DrissionPage原生方法）"""
         comments = []
 
         try:
@@ -484,144 +607,100 @@ class DouyinApi:
             # 滚动评论区加载更多
             for scroll_i in range(3):
                 try:
-                    page.run_js("""
-                        const commentContainer = document.querySelector('[class*="comment-list"]')
-                            || document.querySelector('[class*="CommentList"]')
-                            || document.querySelector('[data-e2e="comment-list"]');
-                        if (commentContainer) {
-                            commentContainer.scrollTop += 500;
-                        } else {
-                            window.scrollBy(0, 300);
-                        }
-                    """)
+                    page.scroll.down(300)
                     await asyncio.sleep(1)
                 except:
                     pass
 
-            # 使用JavaScript提取评论
-            js_extract_comments = """
-            (function() {
-                const comments = [];
+            # 使用DrissionPage原生方法查找评论
+            comment_items = []
+            selectors = [
+                'css:[data-e2e="comment-item"]',
+                'css:[class*="comment-item"]',
+                'css:[class*="CommentItem"]'
+            ]
 
-                // 查找评论项 - 根据截图中的class
-                const commentItems = document.querySelectorAll(
-                    '[data-e2e="comment-item"], ' +
-                    '[class*="comment-item"], ' +
-                    '[class*="CommentItem"], ' +
-                    'div[class*="xzjbH9qV"]'
-                );
-
-                commentItems.forEach(function(item, index) {
-                    try {
-                        // 获取评论文本
-                        let text = '';
-                        const textElem = item.querySelector(
-                            '[class*="comment-info-wrap"] span, ' +
-                            '[class*="LvAtyU_f"] span, ' +
-                            '[class*="j5WZzJdp"], ' +
-                            'span[class*="sU2yAQQU"]'
-                        );
-                        if (textElem) {
-                            text = textElem.textContent.trim();
-                        }
-
-                        // 如果没找到，尝试获取整个评论区域的文本
-                        if (!text) {
-                            const allSpans = item.querySelectorAll('span');
-                            for (let span of allSpans) {
-                                const spanText = span.textContent.trim();
-                                if (spanText.length > 10 && spanText.length < 500) {
-                                    text = spanText;
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 获取用户名
-                        let username = '';
-                        const userElem = item.querySelector(
-                            '[class*="comment-item-avatar"], ' +
-                            '[class*="VPtAXFCJ"], ' +
-                            '[class*="author"], ' +
-                            '[class*="name"]'
-                        );
-                        if (userElem) {
-                            username = userElem.textContent.trim();
-                        }
-
-                        // 获取点赞数
-                        let likes = '0';
-                        const likesElem = item.querySelector('[class*="like"], [class*="count"]');
-                        if (likesElem) {
-                            const likesText = likesElem.textContent.trim();
-                            if (/\\d/.test(likesText)) {
-                                likes = likesText;
-                            }
-                        }
-
-                        if (text && text.length > 2) {
-                            comments.push({
-                                text: text.substring(0, 500),
-                                username: username || 'unknown',
-                                likes: likes,
-                                index: index
-                            });
-                        }
-                    } catch(e) {}
-                });
-
-                return comments;
-            })();
-            """
-
-            js_comments = page.run_js(js_extract_comments)
-
-            if js_comments and len(js_comments) > 0:
-                logger.info(f"JS提取到 {len(js_comments)} 条评论")
-                for c in js_comments[:max_comments]:
-                    raw_text = c.get('text', '')
-                    # 清洗评论文本
-                    cleaned_text = self._clean_comment_text(raw_text)
-                    if cleaned_text and len(cleaned_text) > 2:
-                        comments.append({
-                            'text': cleaned_text,
-                            'username': c.get('username', 'unknown'),
-                            'likes': c.get('likes', '0'),
-                            'collected_at': datetime.now().isoformat()
-                        })
-            else:
-                logger.warning("JS未提取到评论，尝试备用方法...")
-
-                # 备用方法：使用DrissionPage选择器
+            for selector in selectors:
                 try:
-                    comment_elements = page.eles('css:div[data-e2e="comment-item"]', timeout=3)
-                    if not comment_elements:
-                        comment_elements = page.eles('css:div[class*="comment-item"]', timeout=2)
+                    items = page.eles(selector, timeout=2)
+                    if items and len(items) > 0:
+                        comment_items = items
+                        break
+                except:
+                    continue
 
-                    for elem in comment_elements[:max_comments]:
+            if not comment_items:
+                logger.warning("未找到评论元素")
+                return []
+
+            # 解析每个评论
+            for item in comment_items[:max_comments]:
+                try:
+                    # 获取整个评论的文本
+                    full_text = item.text or ''
+
+                    # 获取所有span子元素
+                    spans = item.eles('tag:span', timeout=0.5)
+                    span_data_list = []
+
+                    for span in spans[:20]:  # 最多处理20个span
                         try:
-                            raw_text = elem.text
-                            if raw_text:
-                                # 清洗评论文本
-                                cleaned_text = self._clean_comment_text(raw_text[:500])
-                                if cleaned_text and len(cleaned_text) > 5:
-                                    comments.append({
-                                        'text': cleaned_text,
-                                        'username': 'unknown',
-                                        'likes': '0',
-                                        'collected_at': datetime.now().isoformat()
-                                    })
+                            span_data_list.append({
+                                'text': span.text or '',
+                                'class': span.attr('class') or ''
+                            })
                         except:
                             continue
+
+                    # 使用清洗函数解析
+                    parsed = self._parse_comment_text(full_text, span_data_list)
+
+                    if parsed['text'] and len(parsed['text']) > 2:
+                        comment_data = {
+                            'text': parsed['text'],
+                            'username': parsed['username'],
+                            'likes': parsed['likes'],
+                            'collected_at': datetime.now().isoformat()
+                        }
+
+                        comments.append(comment_data)
+
                 except Exception as e:
-                    logger.warning(f"备用提取方法失败: {e}")
+                    logger.debug(f"解析评论失败: {e}")
+                    continue
 
             logger.info(f"共提取到 {len(comments)} 条评论")
+            return comments
 
         except Exception as e:
             logger.error(f"提取评论失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+        # 备用方法：使用原来的备用提取
+        try:
+            comment_elements = page.eles('css:div[data-e2e="comment-item"]', timeout=3)
+            if not comment_elements:
+                comment_elements = page.eles('css:div[class*="comment-item"]', timeout=2)
+
+            for elem in comment_elements[:max_comments]:
+                try:
+                    raw_text = elem.text
+                    if raw_text:
+                        # 使用原来的清洗方法
+                        cleaned_text = self._clean_comment_text(raw_text[:500])
+                        if cleaned_text and len(cleaned_text) > 5:
+                            comments.append({
+                                'text': cleaned_text,
+                                'username': 'unknown',
+                                'likes': '0',
+                                'collected_at': datetime.now().isoformat()
+                            })
+                except:
+                    continue
+
+        except Exception as e:
+            logger.warning(f"备用提取方法失败: {e}")
 
         return comments
 
@@ -863,16 +942,12 @@ class DouyinApi:
         seen_urls = set()
 
         try:
-            # 【调试】获取初始页面状态
-            logger.info("【调试】获取初始页面状态...")
+            # 获取初始页面状态
             initial_height = page.run_js("return document.body.scrollHeight")
-            logger.info(f"【调试】初始页面高度: {initial_height}")
 
-            # 🔥 尝试先提取一次数据，看看选择器是否正确
-            logger.info("【调试】测试选择器...")
+            # 尝试先提取一次数据，看看选择器是否正确
             new_videos = self._extract_video_data_direct(page, seen_urls)
             collected.extend(new_videos)
-            logger.info(f"【调试】初始提取到 {len(new_videos)} 条视频")
 
             last_height = initial_height
 
@@ -893,9 +968,8 @@ class DouyinApi:
 
                 # 检查是否到达底部
                 new_height = page.run_js("return document.body.scrollHeight")
-                logger.info(f"【调试】滚动后页面高度: {new_height}, 之前高度: {last_height}")
 
-                # 🔥 直接提取视频数据（不获取HTML）
+                # 直接提取视频数据（不获取HTML）
                 new_videos = self._extract_video_data_direct(page, seen_urls)
                 collected.extend(new_videos)
                 logger.info(f"本次滚动新增 {len(new_videos)} 条视频，累计 {len(collected)} 条")
@@ -914,14 +988,75 @@ class DouyinApi:
         return collected
 
     def _extract_video_data_direct(self, page, seen_urls: set) -> List[Dict]:
-        """直接从页面元素提取视频数据（改进版本）"""
+        """直接从页面元素提取视频数据（改进版本 - 使用DrissionPage原生方法）"""
         videos = []
 
         try:
-            # 🔥 方法1: 使用JavaScript直接提取所有视频链接（最可靠）
-            logger.info("【方法1】使用JS提取视频数据...")
-            try:
-                js_extract = """
+            # 使用DrissionPage原生方法查找链接
+            all_links = page.eles('tag:a', timeout=5)
+
+            # 筛选视频链接
+            video_links = []
+            for link in all_links:
+                try:
+                    href = link.attr('href') or ''
+                    if '/video/' in href:
+                        video_links.append(link)
+                except:
+                    continue
+
+            # 解析每个视频
+            for link in video_links[:50]:  # 最多处理50个
+                try:
+                    href = link.attr('href') or ''
+                    if not href:
+                        continue
+
+                    # 处理URL
+                    if href.startswith('//'):
+                        video_url = 'https:' + href
+                    elif href.startswith('/'):
+                        video_url = 'https://www.douyin.com' + href
+                    else:
+                        video_url = href
+
+                    # 去重
+                    if video_url in seen_urls:
+                        continue
+
+                    # 获取链接文本
+                    raw_text = link.text or ''
+
+                    # 使用清洗函数解析
+                    parsed = self._parse_video_title(raw_text)
+
+                    if parsed['title']:  # 只要有标题就保存
+                        video_data = {
+                            'video_url': video_url,
+                            'title': parsed['title'],
+                            'author': parsed['author'],
+                            'likes': parsed['likes'],
+                            'publish_time': parsed.get('publish_time', ''),
+                            'collected_at': datetime.now().isoformat()
+                        }
+
+                        videos.append(video_data)
+                        seen_urls.add(video_url)
+
+                except Exception as e:
+                    logger.debug(f"解析视频链接失败: {e}")
+                    continue
+
+            return videos
+
+        except Exception as e:
+            logger.error(f"提取视频数据失败: {e}")
+            import traceback
+            logger.error(f"详细错误:\n{traceback.format_exc()}")
+
+        # 如果DrissionPage方法失败，尝试原来的JS方法作为备用
+        try:
+            js_extract = """
                 (function() {
                     const results = [];
                     // 查找所有包含 /video/ 的链接
@@ -993,53 +1128,45 @@ class DouyinApi:
                     });
                     return results;
                 })();
-                """
-                js_results = page.run_js(js_extract)
+            """
+            js_results = page.run_js(js_extract)
 
-                if js_results and len(js_results) > 0:
-                    logger.info(f"【JS提取】找到 {len(js_results)} 条视频数据")
+            if js_results and len(js_results) > 0:
+                for item in js_results:
+                    href = item.get('href', '')
+                    if not href:
+                        continue
 
-                    for item in js_results:
-                        href = item.get('href', '')
-                        if not href:
-                            continue
+                    # 处理URL
+                    if href.startswith('//'):
+                        video_url = 'https:' + href
+                    elif href.startswith('/'):
+                        video_url = 'https://www.douyin.com' + href
+                    else:
+                        video_url = href
 
-                        # 处理URL
-                        if href.startswith('//'):
-                            video_url = 'https:' + href
-                        elif href.startswith('/'):
-                            video_url = 'https://www.douyin.com' + href
-                        else:
-                            video_url = href
+                    # 去重
+                    if video_url in seen_urls:
+                        continue
 
-                        # 去重
-                        if video_url in seen_urls:
-                            continue
+                    video_data = {
+                        'video_url': video_url,
+                        'title': item.get('title', ''),
+                        'author': item.get('author', 'unknown'),
+                        'likes': item.get('likes', '0'),
+                        'collected_at': datetime.now().isoformat()
+                    }
 
-                        video_data = {
-                            'video_url': video_url,
-                            'title': item.get('title', ''),
-                            'author': item.get('author', 'unknown'),
-                            'likes': item.get('likes', '0'),
-                            'collected_at': datetime.now().isoformat()
-                        }
+                    videos.append(video_data)
+                    seen_urls.add(video_url)
 
-                        videos.append(video_data)
-                        seen_urls.add(video_url)
+                if len(videos) > 0:
+                    return videos
 
-                        if len(videos) <= 5:
-                            logger.info(f"【调试】视频 {len(videos)}: {video_data.get('title', '')[:50]}")
+        except Exception as js_error:
+            logger.warning(f"JS提取失败: {js_error}")
 
-                    if len(videos) > 0:
-                        logger.info(f"【JS方法成功】共提取到 {len(videos)} 条有效视频")
-                        return videos
-
-            except Exception as js_error:
-                logger.warning(f"JS提取失败: {js_error}")
-
-            # 🔥 方法2: 使用DrissionPage选择器（备用方案）
-            logger.info("【方法2】使用选择器提取...")
-
+            # 方法2: 使用DrissionPage选择器（备用方案）
             # 更精确的选择器列表
             selectors = [
                 'css:a[href*="/video/"]',  # 直接找视频链接
@@ -1053,7 +1180,6 @@ class DouyinApi:
 
             for selector in selectors:
                 try:
-                    logger.info(f"【调试】尝试选择器: {selector}")
                     elements = page.eles(selector, timeout=3)
                     if elements and len(elements) > 0:
                         # 过滤：只保留包含/video/链接的元素
@@ -1072,29 +1198,23 @@ class DouyinApi:
                                 continue
 
                         if valid_elements:
-                            logger.info(f"【选择器 {selector}】找到 {len(valid_elements)} 个有效视频元素")
                             video_elements = valid_elements
                             used_selector = selector
                             break
-                        else:
-                            logger.info(f"【选择器 {selector}】找到 {len(elements)} 个元素，但无有效视频")
                 except Exception as sel_error:
                     logger.warning(f"选择器 {selector} 失败: {sel_error}")
                     continue
 
             if not video_elements:
-                logger.warning("【失败】所有选择器都未找到有效视频元素")
-                # 🔥 调试：保存页面HTML用于分析
+                logger.warning("所有选择器都未找到有效视频元素")
+                # 调试：保存页面HTML用于分析
                 try:
                     page_html = page.html[:10000] if page.html else ""
                     if "验证" in page_html or "captcha" in page_html.lower():
-                        logger.error("❌ 页面包含验证码相关内容")
-                    logger.info(f"【调试】页面HTML前500字符: {page_html[:500]}")
+                        logger.error("页面包含验证码相关内容")
                 except:
                     pass
                 return []
-
-            logger.info(f"准备解析 {len(video_elements)} 个元素")
 
             # 解析每个元素
             for idx, item in enumerate(video_elements[:50]):  # 最多处理50个
@@ -1144,14 +1264,10 @@ class DouyinApi:
                     if video_data.get('title'):
                         videos.append(video_data)
                         seen_urls.add(video_url)
-                        if len(videos) <= 5:
-                            logger.info(f"【调试】视频 {len(videos)}: {video_data.get('title', '')[:50]}")
 
                 except Exception as item_error:
                     logger.debug(f"解析元素 {idx} 失败: {item_error}")
                     continue
-
-            logger.info(f"【成功】共提取到 {len(videos)} 条有效视频")
 
         except Exception as e:
             logger.error(f"直接提取视频数据失败: {e}")
@@ -1173,17 +1289,14 @@ class DouyinApi:
 
             # 查找视频项目容器
             video_items = soup.select('li.SwZLHMKk')
-            logger.info(f"【选择器 li.SwZLHMKk】找到 {len(video_items)} 个视频项目")
 
-            # 【调试】如果没找到，尝试其他选择器
+            # 调试：如果没找到，尝试其他选择器
             if len(video_items) == 0:
-                logger.warning("【调试】未找到 li.SwZLHMKk，尝试查找其他可能的选择器...")
                 # 尝试查找所有的li标签
                 all_li = soup.find_all('li', limit=10)
-                logger.info(f"【调试】找到 {len(all_li)} 个li标签")
                 if all_li:
                     for idx, li in enumerate(all_li[:3]):  # 只显示前3个
-                        logger.info(f"【调试】li[{idx}] classes: {li.get('class', [])}")
+                        pass
 
                 # 尝试查找包含视频的其他常见选择器
                 alt_selectors = [
@@ -1195,7 +1308,6 @@ class DouyinApi:
                 for selector in alt_selectors:
                     items = soup.select(selector)
                     if items:
-                        logger.info(f"【调试】选择器 '{selector}' 找到 {len(items)} 个元素")
                         break
             
             for item in video_items:
