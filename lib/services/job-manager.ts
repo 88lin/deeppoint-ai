@@ -255,28 +255,71 @@ export class JobManager {
         throw new Error('未能获取到任何相关数据');
       }
 
-      // 步骤3: 文本聚类（使用语义向量化 + DBSCAN）
+      // 步骤3: 分离视频和评论进行聚类（避免不同语义层次混淆）
       this.updateJobStatus(jobId, 'processing', '正在进行语义聚类分析...');
-      const clusters = await this.clusteringService.clusterTexts(allRawTexts, 2);
+
+      // 3.1 视频内容聚类
+      const videoTexts = allVideos.map(v => v.title).filter(t => t && t.length > 0);
+      let videoClusters: string[][] = [];
+      if (videoTexts.length > 0) {
+        this.updateJobStatus(jobId, 'processing', `正在对 ${videoTexts.length} 条视频内容进行聚类...`);
+        // 不传递 minClusterSize，让 Python 自动计算 min_samples
+        videoClusters = await this.clusteringService.clusterTexts(videoTexts);
+        console.log(`视频聚类完成: ${videoClusters.length} 个聚类`);
+      }
+
+      // 3.2 评论内容聚类
+      const commentTexts = allComments.map(c => c.comment_text).filter(t => t && t.length > 0);
+      let commentClusters: string[][] = [];
+      if (commentTexts.length > 0) {
+        this.updateJobStatus(jobId, 'processing', `正在对 ${commentTexts.length} 条评论内容进行聚类...`);
+        // 不传递 minClusterSize，让 Python 自动计算 min_samples
+        commentClusters = await this.clusteringService.clusterTexts(commentTexts);
+        console.log(`评论聚类完成: ${commentClusters.length} 个聚类`);
+      }
+
+      // 合并聚类结果（视频聚类在前，评论聚类在后）
+      const clusters = [...videoClusters, ...commentClusters];
 
       if (clusters.length === 0) {
-        throw new Error('无法从数据中识别出明显的痛点聚类');
+        const totalTexts = videoTexts.length + commentTexts.length;
+        throw new Error(
+          `无法从数据中识别出有意义的聚类（需要至少3条相似数据才能形成聚类）。\n` +
+          `当前数据：${videoTexts.length}条视频，${commentTexts.length}条评论。\n` +
+          `建议：增加数据量或使用更相关的搜索关键词。`
+        );
+      }
+
+      console.log(`总聚类数: ${clusters.length} (视频: ${videoClusters.length}, 评论: ${commentClusters.length})`);
+      if (clusters.length < 3) {
+        console.warn(`⚠️ 聚类数量较少(${clusters.length}个)，可能需要更多数据或调整关键词以获得更丰富的分析结果`);
       }
 
       // 构建聚类数据分组（用于导出）
       const clusteredDataGroups: ClusteredDataGroup[] = [];
+      const videoClusterCount = videoClusters.length;
+
       for (let i = 0; i < clusters.length; i++) {
         const cluster = clusters[i];
         const clusterVideos: RawVideoData[] = [];
         const clusterComments: RawCommentData[] = [];
 
-        // 遍历聚类中的每个文本，找到对应的原始数据
-        for (const text of cluster) {
-          const source = textToSourceMap.get(text);
-          if (source) {
-            if (source.type === 'video') {
+        // 判断当前聚类是视频聚类还是评论聚类
+        const isVideoCluster = i < videoClusterCount;
+
+        if (isVideoCluster) {
+          // 视频聚类：从textToSourceMap中找对应的视频数据
+          for (const text of cluster) {
+            const source = textToSourceMap.get(text);
+            if (source && source.type === 'video') {
               clusterVideos.push(source.data as RawVideoData);
-            } else {
+            }
+          }
+        } else {
+          // 评论聚类：从textToSourceMap中找对应的评论数据
+          for (const text of cluster) {
+            const source = textToSourceMap.get(text);
+            if (source && source.type === 'comment') {
               clusterComments.push(source.data as RawCommentData);
             }
           }

@@ -50,16 +50,23 @@ export class ClusteringService {
       minLength?: number;
     } = {}
   ): Promise<ClusteringResult> {
-    const { eps = 0.4, minSamples = 2, minLength = 4 } = options;
+    // eps 和 minSamples 都不设置默认值，让 Python 根据数据量自动计算
+    const { eps, minSamples, minLength = 4 } = options;
 
     return new Promise((resolve, reject) => {
       const args = [
         this.scriptPath,
         '--stdin',
-        '--eps', eps.toString(),
-        '--min-samples', minSamples.toString(),
         '--min-length', minLength.toString()
       ];
+
+      // 只有明确指定了参数才传递，否则让Python自动计算
+      if (eps !== undefined) {
+        args.push('--eps', eps.toString());
+      }
+      if (minSamples !== undefined) {
+        args.push('--min-samples', minSamples.toString());
+      }
 
       const pythonProcess = spawn(this.pythonPath, args, {
         cwd: process.cwd(),
@@ -129,8 +136,9 @@ export class ClusteringService {
    * 兼容旧接口的聚类方法
    * 内部使用新的语义聚类
    */
-  public async clusterTexts(texts: string[], minClusterSize: number = 2): Promise<string[][]> {
+  public async clusterTexts(texts: string[], minClusterSize?: number): Promise<string[][]> {
     const result = await this.clusterTextsWithEmbeddings(texts, {
+      // 只有明确传递了 minClusterSize 才使用，否则让 Python 自动计算
       minSamples: minClusterSize
     });
 
@@ -162,13 +170,22 @@ export class ClusteringService {
    * 降级聚类算法（当 Python 服务不可用时）
    * 使用简单的关键词匹配
    */
-  private fallbackCluster(texts: string[], minClusterSize: number): string[][] {
+  private fallbackCluster(texts: string[], minClusterSize?: number): string[][] {
     if (texts.length === 0) return [];
-    if (texts.length < minClusterSize) return [texts];
+
+    // 最小聚类大小至少为3，保证统计意义
+    const effectiveMinSize = Math.max(minClusterSize || 3, 3);
+
+    // 如果数据量太小无法形成有意义的聚类，返回空数组
+    if (texts.length < effectiveMinSize) {
+      console.warn(`数据量(${texts.length})不足以形成有意义的聚类(需要至少${effectiveMinSize}条)`);
+      return [];
+    }
 
     // 简单的关键词聚类
     const clusters: Map<string, string[]> = new Map();
-    const keywords = ['价格', '质量', '服务', '功能', '使用', '推荐', '问题', '效果'];
+    const keywords = ['价格', '质量', '服务', '功能', '使用', '推荐', '问题', '效果',
+                      '怎么', '求', '哪里', '如何', '为什么', '不会', '难'];
 
     for (const text of texts) {
       let assigned = false;
@@ -188,7 +205,15 @@ export class ClusteringService {
       }
     }
 
-    return Array.from(clusters.values()).filter(c => c.length >= minClusterSize);
+    const result = Array.from(clusters.values()).filter(c => c.length >= effectiveMinSize);
+
+    // 如果过滤后没有结果，检查是否可以放宽要求
+    if (result.length === 0 && texts.length >= 3) {
+      console.warn('Fallback聚类未找到匹配，尝试将所有文本作为单个聚类');
+      return [texts];
+    }
+
+    return result;
   }
 
   // 为每个聚类选择代表性文本
