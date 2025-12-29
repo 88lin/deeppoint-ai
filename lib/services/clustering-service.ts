@@ -24,8 +24,45 @@ export interface ClusterResult {
     paid_interest: "High" | "Medium" | "Low";
     rationale: string;
     potential_product: string;
+
+    // 新增深度分析维度
+    pain_depth?: {
+      surface_pain: string;
+      root_causes: string[];
+      user_scenarios: string[];
+      emotional_intensity: number;
+    };
+
+    market_landscape?: {
+      existing_solutions: Array<{
+        name: string;
+        limitation: string;
+      }>;
+      unmet_needs: string[];
+      opportunity: string;
+    };
+
+    mvp_plan?: {
+      core_features: string[];
+      validation_hypotheses: Array<{
+        hypothesis: string;
+        test_method: string;
+      }>;
+      first_users: string;
+      timeline: string;
+      estimated_cost: string;
+    };
+
+    keyword_relevance?: number;
   };
   representative_texts: string[];
+  priority_score?: {
+    demand_intensity: number;
+    market_size: number;
+    competition: number;
+    overall: number;
+    level: 'High' | 'Medium' | 'Low';
+  };
 }
 
 export class ClusteringService {

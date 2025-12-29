@@ -4,6 +4,7 @@ import { DataSourceFactory } from './data-source-factory';
 import { DataSourceType } from './data-source-interface';
 import { ClusteringService, ClusterResult } from './clustering-service';
 import { GLMService } from './glm-service';
+import { PriorityScorer, PriorityScore } from './priority-scoring';
 
 // 原始视频数据接口
 export interface RawVideoData {
@@ -49,6 +50,13 @@ export interface Job {
     commentCount?: number;
     textCount?: number;
   };
+  // 数据质量元信息
+  dataQuality?: {
+    level: 'reliable' | 'preliminary' | 'exploratory';  // 可靠样本 | 初步验证 | 小样本探索
+    totalDataSize: number;
+    clusterCount: number;
+    averageClusterSize: number;
+  };
   // 原始数据存储
   rawData?: {
     videos: RawVideoData[];
@@ -72,10 +80,12 @@ export class JobManager {
   private jobs: Map<string, Job> = new Map();
   private clusteringService: ClusteringService;
   private glmService: GLMService;
+  private priorityScorer: PriorityScorer;
 
   constructor() {
     this.clusteringService = new ClusteringService();
     this.glmService = new GLMService();
+    this.priorityScorer = new PriorityScorer();
   }
 
   // 创建新任务
@@ -345,8 +355,21 @@ export class JobManager {
         const representativeTexts = this.clusteringService.getRepresentativeTexts(cluster, 8);
 
         try {
-          // 调用GLM分析聚类
-          const analysis = await this.glmService.analyzeCluster(representativeTexts);
+          // 调用GLM分析聚类（传递关键词和数据规模）
+          const analysis = await this.glmService.analyzeCluster(
+            representativeTexts,
+            job.keywords,
+            allRawTexts.length
+          );
+
+          // 计算优先级分数
+          const priorityScore = this.priorityScorer.scoreCluster({
+            clusterSize: cluster.length,
+            totalDataSize: allRawTexts.length,
+            emotionalIntensity: analysis.pain_depth?.emotional_intensity || 2,
+            keywords: job.keywords,
+            existingSolutions: analysis.market_landscape?.existing_solutions || []
+          });
 
           const result: ClusterResult = {
             id: this.clusteringService.generateClusterId(i),
@@ -355,9 +378,16 @@ export class JobManager {
               one_line_pain: analysis.one_line_pain || '用户痛点待分析',
               paid_interest: analysis.paid_interest || 'Medium',
               rationale: analysis.rationale || '基于用户评论分析',
-              potential_product: analysis.potential_product || '产品概念待构思'
+              potential_product: analysis.potential_product || '产品概念待构思',
+
+              // 新增深度分析维度
+              pain_depth: analysis.pain_depth,
+              market_landscape: analysis.market_landscape,
+              mvp_plan: analysis.mvp_plan,
+              keyword_relevance: analysis.keyword_relevance
             },
-            representative_texts: representativeTexts.slice(0, 5)
+            representative_texts: representativeTexts.slice(0, 5),
+            priority_score: priorityScore
           };
 
           results.push(result);
@@ -370,7 +400,8 @@ export class JobManager {
           if (i < clusters.length - 1) {
             await new Promise(resolve => setTimeout(resolve, 1000));
           }
-        } catch {
+        } catch (error) {
+          console.error(`聚类 ${i} 分析失败:`, error);
           // 创建一个默认结果
           const result: ClusterResult = {
             id: this.clusteringService.generateClusterId(i),
@@ -387,7 +418,37 @@ export class JobManager {
         }
       }
 
-      // 步骤5: 完成任务
+      // 按优先级排序（从高到低）
+      results.sort((a, b) => {
+        const scoreA = a.priority_score?.overall || 0;
+        const scoreB = b.priority_score?.overall || 0;
+        return scoreB - scoreA;
+      });
+
+      // 步骤5: 添加数据质量元信息
+      const totalDataSize = allRawTexts.length;
+      const clusterCount = results.length;
+      const averageClusterSize = clusterCount > 0
+        ? Math.round(results.reduce((sum, r) => sum + r.size, 0) / clusterCount)
+        : 0;
+
+      let qualityLevel: 'reliable' | 'preliminary' | 'exploratory';
+      if (totalDataSize < 50) {
+        qualityLevel = 'exploratory';
+      } else if (totalDataSize < 200) {
+        qualityLevel = 'preliminary';
+      } else {
+        qualityLevel = 'reliable';
+      }
+
+      job.dataQuality = {
+        level: qualityLevel,
+        totalDataSize,
+        clusterCount,
+        averageClusterSize
+      };
+
+      // 步骤6: 完成任务
       job.results = results;
       job.status = 'completed';
       job.progress = '分析完成';
