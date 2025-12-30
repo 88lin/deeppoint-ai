@@ -78,7 +78,7 @@ export default function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps)
           onChange={(e) => setKeywords(e.target.value)}
           disabled={isLoading}
           placeholder="例如：钓鱼, 露营, 装备"
-          className="w-full bg-[#FBFBF9] text-[#18181B] font-medium py-3 px-4 rounded-xl border-none focus:ring-2 focus:ring-[#18181B]/10 placeholder-gray-400 transition disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-full bg-[#FBFBF9] text-[#18181B] font-medium py-3 px-4 rounded-xl border border-transparent outline-none focus:bg-amber-50 focus:border-amber-400 focus:ring-2 focus:ring-amber-400/20 placeholder-gray-400 transition disabled:opacity-50 disabled:cursor-not-allowed"
         />
       </div>
 
