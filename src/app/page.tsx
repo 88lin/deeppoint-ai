@@ -4,7 +4,7 @@ import { useState } from "react";
 import useSWR from "swr";
 import Link from "next/link";
 import AnalysisForm from "@/components/AnalysisForm";
-import JobStatus from "@/components/JobStatus";
+import LoadingAnimation from "@/components/LoadingAnimation";
 import ResultsTable from "@/components/ResultsTable";
 import DetailModal from "@/components/DetailModal";
 import ExportButton from "@/components/ExportButton";
@@ -248,21 +248,20 @@ export default function Home() {
               isLoading={isLoading}
             />
           </div>
-
-          {/* 状态卡片 */}
-          {jobId && (
-            <div className="fade-in">
-              <JobStatus
-                status={jobData?.status || "processing"}
-                progressText={jobData?.progress || "正在初始化..."}
-                error={jobData?.error || (jobError ? "网络错误，请重试" : undefined)}
-              />
-            </div>
-          )}
         </div>
 
         {/* 右侧：结果展示区 */}
         <div className="lg:col-span-8 flex flex-col h-full">
+          {/* Loading 状态 */}
+          {isLoading && (
+            <div className="h-full min-h-[500px] bg-white/70 backdrop-blur-sm border border-amber-100 rounded-3xl shadow-neuro overflow-hidden fade-in">
+              <LoadingAnimation
+                progressText={jobData?.progress || "正在初始化..."}
+                status={jobData?.status || "processing"}
+              />
+            </div>
+          )}
+
           {/* 空状态 Placeholder */}
           {results.length === 0 && !isLoading && (
             <div className="h-full min-h-[400px] bg-white/50 border border-dashed border-gray-300 rounded-3xl flex flex-col items-center justify-center p-12 text-center">
