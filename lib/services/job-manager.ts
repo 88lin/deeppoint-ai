@@ -4,6 +4,35 @@ import { DataSourceFactory } from './data-source-factory';
 import { DataSourceType } from './data-source-interface';
 import { ClusteringService, ClusterResult } from './clustering-service';
 import { GLMService } from './glm-service';
+import { PriorityScorer, PriorityScore } from './priority-scoring';
+
+// 原始视频数据接口
+export interface RawVideoData {
+  title: string;
+  author: string;
+  video_url: string;
+  publish_time?: string;
+  likes: string;
+  collected_at: string;
+  comment_count?: number;
+  description?: string;
+}
+
+// 原始评论数据接口
+export interface RawCommentData {
+  video_title: string;
+  comment_text: string;
+  username: string;
+  likes: string;
+}
+
+// 聚类数据接口
+export interface ClusteredDataGroup {
+  clusterId: number;
+  size: number;
+  videos: RawVideoData[];
+  comments: RawCommentData[];
+}
 
 export interface Job {
   jobId: string;
@@ -21,6 +50,21 @@ export interface Job {
     commentCount?: number;
     textCount?: number;
   };
+  // 数据质量元信息
+  dataQuality?: {
+    level: 'reliable' | 'preliminary' | 'exploratory';  // 可靠样本 | 初步验证 | 小样本探索
+    totalDataSize: number;
+    clusterCount: number;
+    averageClusterSize: number;
+  };
+  // 原始数据存储
+  rawData?: {
+    videos: RawVideoData[];
+    comments: RawCommentData[];
+    rawTexts: string[];
+  };
+  // 聚类后的数据分组
+  clusteredData?: ClusteredDataGroup[];
   error?: string;
 }
 
@@ -36,10 +80,12 @@ export class JobManager {
   private jobs: Map<string, Job> = new Map();
   private clusteringService: ClusteringService;
   private glmService: GLMService;
+  private priorityScorer: PriorityScorer;
 
   constructor() {
     this.clusteringService = new ClusteringService();
     this.glmService = new GLMService();
+    this.priorityScorer = new PriorityScorer();
   }
 
   // 创建新任务
@@ -103,6 +149,10 @@ export class JobManager {
 
       // 步骤2: 抓取数据
       const allRawTexts: string[] = [];
+      const allVideos: RawVideoData[] = [];
+      const allComments: RawCommentData[] = [];
+      // 建立文本索引到原始数据的映射
+      const textToSourceMap: Map<string, { type: 'video' | 'comment', data: RawVideoData | RawCommentData }> = new Map();
       let totalVideoCount = 0;
       let totalCommentCount = 0;
 
@@ -122,37 +172,179 @@ export class JobManager {
           allRawTexts.push(...result.rawTexts);
           totalVideoCount += result.videoCount || 0;
           totalCommentCount += result.commentCount || 0;
+
+          // 保存原始视频数据
+          if (result.videos) {
+            for (const video of result.videos) {
+              const videoData: RawVideoData = {
+                title: video.title || '',
+                author: video.author || '',
+                video_url: video.video_url || '',
+                publish_time: video.publish_time,
+                likes: video.likes || '0',
+                collected_at: video.collected_at || new Date().toISOString(),
+                comment_count: video.comment_count,
+                description: video.description
+              };
+              allVideos.push(videoData);
+
+              // 建立视频标题到数据的映射
+              if (videoData.title) {
+                textToSourceMap.set(videoData.title, { type: 'video', data: videoData });
+              }
+            }
+          }
+
+          // 保存原始评论数据
+          if (result.allComments) {
+            for (const comment of result.allComments) {
+              const commentData: RawCommentData = {
+                video_title: comment.video_title || '',
+                comment_text: comment.comment_text || '',
+                username: comment.username || '',
+                likes: comment.likes || '0'
+              };
+              allComments.push(commentData);
+
+              // 建立评论文本到数据的映射
+              if (commentData.comment_text) {
+                textToSourceMap.set(commentData.comment_text, { type: 'comment', data: commentData });
+              }
+            }
+          }
         } else {
           // 标准抓取模式
           this.updateJobStatus(jobId, 'processing', `正在从${sourceName}抓取 "${keyword}" 相关数据...`);
 
-          const { rawTexts } = await dataSourceService.searchAndFetch(
+          const result = await dataSourceService.searchAndFetch(
             keyword,
             Math.floor(job.limit / job.keywords.length)
           );
 
-          allRawTexts.push(...rawTexts);
+          allRawTexts.push(...result.rawTexts);
+
+          // 保存原始视频数据（标准模式）
+          if (result.videos) {
+            for (const video of result.videos) {
+              const videoData: RawVideoData = {
+                title: video.title || '',
+                author: video.author || '',
+                video_url: video.video_url || '',
+                publish_time: video.publish_time,
+                likes: video.likes || '0',
+                collected_at: video.collected_at || new Date().toISOString(),
+                comment_count: video.comment_count,
+                description: video.description
+              };
+              allVideos.push(videoData);
+
+              // 建立视频标题到数据的映射
+              if (videoData.title) {
+                textToSourceMap.set(videoData.title, { type: 'video', data: videoData });
+              }
+            }
+          }
         }
       }
 
       // 保存抓取统计
       job.crawlStats = {
-        videoCount: totalVideoCount,
-        commentCount: totalCommentCount,
+        videoCount: totalVideoCount || allVideos.length,
+        commentCount: totalCommentCount || allComments.length,
         textCount: allRawTexts.length
+      };
+
+      // 保存原始数据
+      job.rawData = {
+        videos: allVideos,
+        comments: allComments,
+        rawTexts: allRawTexts
       };
 
       if (allRawTexts.length === 0) {
         throw new Error('未能获取到任何相关数据');
       }
 
-      // 步骤3: 文本聚类
-      this.updateJobStatus(jobId, 'processing', '正在进行聚类分析...');
-      const clusters = this.clusteringService.clusterTexts(allRawTexts, 2);
+      // 步骤3: 分离视频和评论进行聚类（避免不同语义层次混淆）
+      this.updateJobStatus(jobId, 'processing', '正在进行语义聚类分析...');
+
+      // 3.1 视频内容聚类
+      const videoTexts = allVideos.map(v => v.title).filter(t => t && t.length > 0);
+      let videoClusters: string[][] = [];
+      if (videoTexts.length > 0) {
+        this.updateJobStatus(jobId, 'processing', `正在对 ${videoTexts.length} 条视频内容进行聚类...`);
+        // 不传递 minClusterSize，让 Python 自动计算 min_samples
+        videoClusters = await this.clusteringService.clusterTexts(videoTexts);
+        console.log(`视频聚类完成: ${videoClusters.length} 个聚类`);
+      }
+
+      // 3.2 评论内容聚类
+      const commentTexts = allComments.map(c => c.comment_text).filter(t => t && t.length > 0);
+      let commentClusters: string[][] = [];
+      if (commentTexts.length > 0) {
+        this.updateJobStatus(jobId, 'processing', `正在对 ${commentTexts.length} 条评论内容进行聚类...`);
+        // 不传递 minClusterSize，让 Python 自动计算 min_samples
+        commentClusters = await this.clusteringService.clusterTexts(commentTexts);
+        console.log(`评论聚类完成: ${commentClusters.length} 个聚类`);
+      }
+
+      // 合并聚类结果（视频聚类在前，评论聚类在后）
+      const clusters = [...videoClusters, ...commentClusters];
 
       if (clusters.length === 0) {
-        throw new Error('无法从数据中识别出明显的痛点聚类');
+        const totalTexts = videoTexts.length + commentTexts.length;
+        throw new Error(
+          `无法从数据中识别出有意义的聚类（需要至少3条相似数据才能形成聚类）。\n` +
+          `当前数据：${videoTexts.length}条视频，${commentTexts.length}条评论。\n` +
+          `建议：增加数据量或使用更相关的搜索关键词。`
+        );
       }
+
+      console.log(`总聚类数: ${clusters.length} (视频: ${videoClusters.length}, 评论: ${commentClusters.length})`);
+      if (clusters.length < 3) {
+        console.warn(`⚠️ 聚类数量较少(${clusters.length}个)，可能需要更多数据或调整关键词以获得更丰富的分析结果`);
+      }
+
+      // 构建聚类数据分组（用于导出）
+      const clusteredDataGroups: ClusteredDataGroup[] = [];
+      const videoClusterCount = videoClusters.length;
+
+      for (let i = 0; i < clusters.length; i++) {
+        const cluster = clusters[i];
+        const clusterVideos: RawVideoData[] = [];
+        const clusterComments: RawCommentData[] = [];
+
+        // 判断当前聚类是视频聚类还是评论聚类
+        const isVideoCluster = i < videoClusterCount;
+
+        if (isVideoCluster) {
+          // 视频聚类：从textToSourceMap中找对应的视频数据
+          for (const text of cluster) {
+            const source = textToSourceMap.get(text);
+            if (source && source.type === 'video') {
+              clusterVideos.push(source.data as RawVideoData);
+            }
+          }
+        } else {
+          // 评论聚类：从textToSourceMap中找对应的评论数据
+          for (const text of cluster) {
+            const source = textToSourceMap.get(text);
+            if (source && source.type === 'comment') {
+              clusterComments.push(source.data as RawCommentData);
+            }
+          }
+        }
+
+        clusteredDataGroups.push({
+          clusterId: i,
+          size: cluster.length,
+          videos: clusterVideos,
+          comments: clusterComments
+        });
+      }
+
+      // 保存聚类数据
+      job.clusteredData = clusteredDataGroups;
 
       // 步骤4: LLM分析每个聚类
       this.updateJobStatus(jobId, 'processing', '正在调用LLM分析...');
@@ -163,8 +355,21 @@ export class JobManager {
         const representativeTexts = this.clusteringService.getRepresentativeTexts(cluster, 8);
 
         try {
-          // 调用GLM分析聚类
-          const analysis = await this.glmService.analyzeCluster(representativeTexts);
+          // 调用GLM分析聚类（传递关键词和数据规模）
+          const analysis = await this.glmService.analyzeCluster(
+            representativeTexts,
+            job.keywords,
+            allRawTexts.length
+          );
+
+          // 计算优先级分数
+          const priorityScore = this.priorityScorer.scoreCluster({
+            clusterSize: cluster.length,
+            totalDataSize: allRawTexts.length,
+            emotionalIntensity: analysis.pain_depth?.emotional_intensity || 2,
+            glmMarketScore: analysis.market_size_score || 2.5,
+            existingSolutions: analysis.market_landscape?.existing_solutions || []
+          });
 
           const result: ClusterResult = {
             id: this.clusteringService.generateClusterId(i),
@@ -173,9 +378,16 @@ export class JobManager {
               one_line_pain: analysis.one_line_pain || '用户痛点待分析',
               paid_interest: analysis.paid_interest || 'Medium',
               rationale: analysis.rationale || '基于用户评论分析',
-              potential_product: analysis.potential_product || '产品概念待构思'
+              potential_product: analysis.potential_product || '产品概念待构思',
+
+              // 新增深度分析维度
+              pain_depth: analysis.pain_depth,
+              market_landscape: analysis.market_landscape,
+              mvp_plan: analysis.mvp_plan,
+              keyword_relevance: analysis.keyword_relevance
             },
-            representative_texts: representativeTexts.slice(0, 5)
+            representative_texts: representativeTexts.slice(0, 5),
+            priority_score: priorityScore
           };
 
           results.push(result);
@@ -188,7 +400,8 @@ export class JobManager {
           if (i < clusters.length - 1) {
             await new Promise(resolve => setTimeout(resolve, 1000));
           }
-        } catch {
+        } catch (error) {
+          console.error(`聚类 ${i} 分析失败:`, error);
           // 创建一个默认结果
           const result: ClusterResult = {
             id: this.clusteringService.generateClusterId(i),
@@ -205,7 +418,37 @@ export class JobManager {
         }
       }
 
-      // 步骤5: 完成任务
+      // 按优先级排序（从高到低）
+      results.sort((a, b) => {
+        const scoreA = a.priority_score?.overall || 0;
+        const scoreB = b.priority_score?.overall || 0;
+        return scoreB - scoreA;
+      });
+
+      // 步骤5: 添加数据质量元信息
+      const totalDataSize = allRawTexts.length;
+      const clusterCount = results.length;
+      const averageClusterSize = clusterCount > 0
+        ? Math.round(results.reduce((sum, r) => sum + r.size, 0) / clusterCount)
+        : 0;
+
+      let qualityLevel: 'reliable' | 'preliminary' | 'exploratory';
+      if (totalDataSize < 50) {
+        qualityLevel = 'exploratory';
+      } else if (totalDataSize < 200) {
+        qualityLevel = 'preliminary';
+      } else {
+        qualityLevel = 'reliable';
+      }
+
+      job.dataQuality = {
+        level: qualityLevel,
+        totalDataSize,
+        clusterCount,
+        averageClusterSize
+      };
+
+      // 步骤6: 完成任务
       job.results = results;
       job.status = 'completed';
       job.progress = '分析完成';

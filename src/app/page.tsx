@@ -4,10 +4,12 @@ import { useState } from "react";
 import useSWR from "swr";
 import Link from "next/link";
 import AnalysisForm from "@/components/AnalysisForm";
-import JobStatus from "@/components/JobStatus";
+import LoadingAnimation from "@/components/LoadingAnimation";
 import ResultsTable from "@/components/ResultsTable";
 import DetailModal from "@/components/DetailModal";
 import ExportButton from "@/components/ExportButton";
+import RawDataExportButton from "@/components/RawDataExportButton";
+import DataQualityBanner from "@/components/DataQualityBanner";
 
 // ClusterResult 类型定义
 interface ClusterResult {
@@ -18,8 +20,74 @@ interface ClusterResult {
     paid_interest: "High" | "Medium" | "Low";
     rationale: string;
     potential_product: string;
+
+    // 新增深度分析维度
+    pain_depth?: {
+      surface_pain: string;
+      root_causes: string[];
+      user_scenarios: string[];
+      emotional_intensity: number;
+    };
+
+    market_landscape?: {
+      existing_solutions: Array<{
+        name: string;
+        limitation: string;
+      }>;
+      unmet_needs: string[];
+      opportunity: string;
+    };
+
+    mvp_plan?: {
+      core_features: string[];
+      validation_hypotheses: Array<{
+        hypothesis: string;
+        test_method: string;
+      }>;
+      first_users: string;
+      timeline: string;
+      estimated_cost: string;
+    };
+
+    keyword_relevance?: number;
   };
   representative_texts: string[];
+  priority_score?: {
+    demand_intensity: number;
+    market_size: number;
+    competition: number;
+    overall: number;
+    level: 'High' | 'Medium' | 'Low';
+  };
+}
+
+// 原始数据类型
+interface RawData {
+  videos: Array<{
+    title: string;
+    author: string;
+    video_url: string;
+    publish_time?: string;
+    likes: string;
+    collected_at: string;
+    comment_count?: number;
+    description?: string;
+  }>;
+  comments: Array<{
+    video_title: string;
+    comment_text: string;
+    username: string;
+    likes: string;
+  }>;
+  rawTexts: string[];
+}
+
+// 聚类数据类型
+interface ClusteredDataGroup {
+  clusterId: number;
+  size: number;
+  videos: RawData['videos'];
+  comments: RawData['comments'];
 }
 
 // API 响应类型
@@ -27,7 +95,16 @@ interface JobResponse {
   jobId: string;
   status: string;
   progress: string;
+  keywords?: string[];
   results?: ClusterResult[];
+  rawData?: RawData;
+  clusteredData?: ClusteredDataGroup[];
+  dataQuality?: {
+    level: 'reliable' | 'preliminary' | 'exploratory';
+    totalDataSize: number;
+    clusterCount: number;
+    averageClusterSize: number;
+  };
   error?: string;
 }
 
@@ -37,6 +114,9 @@ const fetcher = (url: string) => fetch(url).then(res => res.json());
 export default function Home() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [results, setResults] = useState<ClusterResult[]>([]);
+  const [rawData, setRawData] = useState<RawData | undefined>(undefined);
+  const [clusteredData, setClusteredData] = useState<ClusteredDataGroup[] | undefined>(undefined);
+  const [keywords, setKeywords] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
   // 模态框状态管理
@@ -58,6 +138,11 @@ export default function Home() {
       onSuccess: (data) => {
         if (data.status === "completed" && data.results) {
           setResults(data.results);
+          setRawData(data.rawData);
+          setClusteredData(data.clusteredData);
+          if (data.keywords) {
+            setKeywords(data.keywords);
+          }
           setIsLoading(false);
         } else if (data.status === "failed") {
           setIsLoading(false);
@@ -66,11 +151,14 @@ export default function Home() {
     }
   );
 
-  const handleAnalysisSubmit = async (keywords: string[], dataSource: 'xiaohongshu' | 'douyin', deepCrawl: boolean, maxVideos: number) => {
+  const handleAnalysisSubmit = async (submittedKeywords: string[], dataSource: 'xiaohongshu' | 'douyin', deepCrawl: boolean, maxVideos: number) => {
     try {
       setIsLoading(true);
       setJobId(null);
       setResults([]);
+      setRawData(undefined);
+      setClusteredData(undefined);
+      setKeywords(submittedKeywords);
 
       const response = await fetch('/api/analyze', {
         method: 'POST',
@@ -78,7 +166,7 @@ export default function Home() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          keywords,
+          keywords: submittedKeywords,
           limit: 200,
           dataSource,
           deepCrawl,
@@ -160,21 +248,20 @@ export default function Home() {
               isLoading={isLoading}
             />
           </div>
-
-          {/* 状态卡片 */}
-          {jobId && (
-            <div className="fade-in">
-              <JobStatus
-                status={jobData?.status || "processing"}
-                progressText={jobData?.progress || "正在初始化..."}
-                error={jobData?.error || (jobError ? "网络错误，请重试" : undefined)}
-              />
-            </div>
-          )}
         </div>
 
         {/* 右侧：结果展示区 */}
         <div className="lg:col-span-8 flex flex-col h-full">
+          {/* Loading 状态 */}
+          {isLoading && (
+            <div className="h-full min-h-[500px] bg-white/70 backdrop-blur-sm border border-amber-100 rounded-3xl shadow-neuro overflow-hidden fade-in">
+              <LoadingAnimation
+                progressText={jobData?.progress || "正在初始化..."}
+                status={jobData?.status || "processing"}
+              />
+            </div>
+          )}
+
           {/* 空状态 Placeholder */}
           {results.length === 0 && !isLoading && (
             <div className="h-full min-h-[400px] bg-white/50 border border-dashed border-gray-300 rounded-3xl flex flex-col items-center justify-center p-12 text-center">
@@ -192,7 +279,7 @@ export default function Home() {
           {results.length > 0 && (
             <div className="fade-in space-y-5">
               {/* Header Stats */}
-              <div className="grid grid-cols-3 gap-4 mb-2">
+              <div className="grid grid-cols-4 gap-4 mb-2">
                 <div className="bg-white rounded-2xl p-4 shadow-neuro">
                   <div className="text-gray-400 text-xs font-semibold uppercase">Total Signals</div>
                   <div className="text-2xl font-bold text-[#18181B] mt-1">{totalSignals}</div>
@@ -202,7 +289,13 @@ export default function Home() {
                   <div className="text-2xl font-bold text-[#18181B] mt-1">{results.length}</div>
                 </div>
                 <ExportButton results={results} />
+                <RawDataExportButton rawData={rawData} clusteredData={clusteredData} keywords={keywords} />
               </div>
+
+              {/* 数据质量提示 */}
+              {jobData?.dataQuality && (
+                <DataQualityBanner dataQuality={jobData.dataQuality} />
+              )}
 
               {/* Card Grid */}
               <ResultsTable
