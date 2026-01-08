@@ -47,6 +47,7 @@
 - Node.js >= 18
 - Python >= 3.10
 - npm 或 pnpm
+- Google Chrome
 
 ### 1. 安装依赖
 
