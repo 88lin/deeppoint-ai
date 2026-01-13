@@ -54,7 +54,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/deeppoint-ai.git
+git clone https://github.com/weiyf2/deeppoint-ai.git
 cd deeppoint-ai
 
 # 安装 Node.js 依赖
